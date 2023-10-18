@@ -2,7 +2,7 @@
 import os
 import random
 import warnings
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
 import numpy as np
 import pandas as pd
 import torch
@@ -25,7 +25,7 @@ CFG = {
     'SEED' : 41,
     'ACUM' : 8,
     'BATCH_SIZE' : 32 ,
-    'EPOCHS' : 30,
+    'EPOCHS' : 5,
     'LR' : 3e-4
 }
 MODEL_NAME = "openai/whisper-base"
@@ -43,9 +43,6 @@ seed_everything(CFG['SEED']) # Seed 고정
 # %%
 df = pd.read_csv('./speech_data/train.csv')
 df.path = df.path.str.replace('./','./speech_data/')
-train_df, val_df, _, _ = train_test_split(df,df['label'],test_size = 0.2, random_state = CFG['SEED'])
-train_df.reset_index(drop=True, inplace=True)
-val_df.reset_index(drop=True, inplace=True)
 
 #%%
 class CustomDataSet(Dataset):
@@ -66,14 +63,6 @@ class CustomDataSet(Dataset):
             return input
 
 
-# %%
-processor = AutoFeatureExtractor.from_pretrained(MODEL_NAME)
-
-train_dataset = CustomDataSet(train_df['path'], train_df['label'], processor)
-valid_dataset = CustomDataSet(val_df['path'], val_df['label'], processor)
-
-train_loader = DataLoader(train_dataset, batch_size = CFG['BATCH_SIZE']//CFG['ACUM'], shuffle = True, num_workers= 0)
-valid_loader = DataLoader(valid_dataset, batch_size = CFG['BATCH_SIZE']//CFG['ACUM'], shuffle = False, num_workers= 0)
 #%%
 
 class BaseModel(torch.nn.Module):
@@ -100,7 +89,7 @@ def validation(model, valid_loader, criterion, device):
             inputs = inputs.to(device)
             labels = labels.to(device)
 
-            output = model(inputs)#.logits
+            output = model(inputs).logits
             loss = criterion(output, labels)
 
             val_loss.append(loss.item())
@@ -129,7 +118,7 @@ def train(model, train_loader, valid_loader, optimizer, scheduler, device):
 
             optimizer.zero_grad()
             
-            output = model(inputs)#.logits
+            output = model(inputs).logits
             loss = criterion(output, labels)
 
             (loss/CFG['ACUM']).backward()
@@ -161,12 +150,27 @@ def train(model, train_loader, valid_loader, optimizer, scheduler, device):
         
 # %%
 model = WhisperForAudioClassification.from_pretrained(MODEL_NAME,num_labels = 6)
-#model = BaseModel()
-#%%
-optimizer = torch.optim.Adam(params = model.parameters(), lr = CFG['LR'])
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, threshold_mode='abs', verbose=True)
+S_kfold = StratifiedKFold(n_splits = 5, shuffle = False)
 
-train(model, train_loader, valid_loader, optimizer, scheduler, device)
+model.eval()
+
+processor = AutoFeatureExtractor.from_pretrained(MODEL_NAME)
+optimizer = torch.optim.AdamW(params = model.parameters(), lr = CFG["LR"])
+#%%
+
+for fold_num, (train_idx, val_idx) in enumerate(S_kfold.split(df['path'],df['label'])):
+    train_df = df.iloc[train_idx].reset_index(drop = True)
+    train_dataset = CustomDataSet(train_df['path'], train_df['label'], processor)
+    train_loader = DataLoader(train_dataset, batch_size = CFG['BATCH_SIZE']//CFG['ACUM'], shuffle=True, num_workers=0)
+
+    val_df = df.iloc[val_idx].reset_index(drop = True)
+    val_dataset = CustomDataSet(val_df['path'],val_df['label'], processor)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=CFG['BATCH_SIZE']//CFG['ACUM'], shuffle=False, num_workers=0)
+
+    train(model, train_loader, val_loader, optimizer, None, device)
+    
+    # torch.save(model.state_dict(), f'./ckp/best_model_score_{fold_num}.pt')
+    # print(f'{fold_num}_model_save !')
 
 #%%
 infer_model = WhisperForAudioClassification.from_pretrained(MODEL_NAME,num_labels = 6)
